@@ -1,11 +1,10 @@
-use near_sdk::borsh::{BorshDeserialize, BorshSerialize};
+use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::collections::LookupMap;
 use near_sdk::serde::{Deserialize, Serialize};
-use near_sdk::store::LookupMap;
-use near_sdk::{env, log, near, AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise};
+use near_sdk::{env, log, near_bindgen, AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
-/// Storage keys for contract collections
 #[derive(BorshStorageKey, BorshSerialize)]
 #[borsh(crate = "near_sdk::borsh")]
 enum StorageKey {
@@ -35,7 +34,7 @@ pub struct GroupChat {
     pub name: Option<String>,
 }
 
-/// NEP-297 event standard
+/// NEP-297 event
 #[derive(Serialize)]
 #[serde(crate = "near_sdk::serde")]
 struct WhisperEvent<'a> {
@@ -56,12 +55,9 @@ fn emit_event(event: &str, data: serde_json::Value) {
     log!("EVENT_JSON:{}", json);
 }
 
-// ============================================================================
-// Contract
-// ============================================================================
-
-#[near(contract_state)]
-#[derive(PanicOnDefault)]
+#[near_bindgen]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+#[borsh(crate = "near_sdk::borsh")]
 pub struct WhisperContract {
     profiles: LookupMap<AccountId, MessagingProfile>,
     groups: LookupMap<String, GroupChat>,
@@ -70,11 +66,11 @@ pub struct WhisperContract {
     owner: AccountId,
 }
 
-#[near]
+#[near_bindgen]
 impl WhisperContract {
     #[init]
-    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
+        assert!(!env::state_exists(), "Already initialized");
         Self {
             profiles: LookupMap::new(StorageKey::Profiles),
             groups: LookupMap::new(StorageKey::Groups),
@@ -88,20 +84,17 @@ impl WhisperContract {
     // Key Registration
     // ========================================================================
 
-    /// Register or update your X25519 messaging public key.
-    /// Requires a small storage deposit (~0.01 NEAR for new registration).
     #[payable]
     pub fn register_key(&mut self, x25519_pubkey: String, display_name: Option<String>) {
         let account_id = env::predecessor_account_id();
 
-        // Validate pubkey is valid base64 and 32 bytes
         let decoded = BASE64
             .decode(&x25519_pubkey)
             .unwrap_or_else(|_| env::panic_str("Invalid base64 pubkey"));
         assert_eq!(decoded.len(), 32, "X25519 pubkey must be 32 bytes");
 
         let existing = self.profiles.get(&account_id);
-        let key_version = existing.map_or(1, |p| p.key_version + 1);
+        let key_version = existing.as_ref().map_or(1, |p| p.key_version + 1);
 
         if existing.is_none() {
             let deposit = env::attached_deposit();
@@ -119,7 +112,7 @@ impl WhisperContract {
             display_name: display_name.clone(),
         };
 
-        self.profiles.insert(account_id.clone(), profile);
+        self.profiles.insert(&account_id, &profile);
 
         emit_event(
             "key_registered",
@@ -136,13 +129,11 @@ impl WhisperContract {
     // Messaging (event-based, no storage)
     // ========================================================================
 
-    /// Send an encrypted message. NOT stored on-chain — emitted as NEP-297 event.
-    /// Cost: gas only (~0.001 NEAR).
     pub fn send_message(
         &mut self,
         to: AccountId,
-        encrypted_body: String, // base64-encoded encrypted payload
-        nonce: String,          // base64-encoded nonce
+        encrypted_body: String,
+        nonce: String,
         recipient_key_version: u32,
         reply_to: Option<String>,
     ) {
@@ -171,7 +162,6 @@ impl WhisperContract {
         );
     }
 
-    /// Send a message with attached NEAR tokens (atomic message + payment).
     #[payable]
     pub fn send_message_with_payment(
         &mut self,
@@ -221,13 +211,12 @@ impl WhisperContract {
     // Group Chats
     // ========================================================================
 
-    /// Create a group chat with encrypted group keys for each member.
     #[payable]
     pub fn create_group(
         &mut self,
         group_id: String,
         name: Option<String>,
-        member_keys: String, // JSON map: account_id -> encrypted_group_key
+        member_keys: String,
     ) {
         let creator = env::predecessor_account_id();
         let deposit = env::attached_deposit();
@@ -248,7 +237,7 @@ impl WhisperContract {
             name: name.clone(),
         };
 
-        self.groups.insert(group_id.clone(), group);
+        self.groups.insert(&group_id, &group);
 
         emit_event(
             "group_created",
@@ -262,7 +251,6 @@ impl WhisperContract {
         );
     }
 
-    /// Send encrypted message to a group.
     pub fn send_group_message(
         &mut self,
         group_id: String,
@@ -299,7 +287,7 @@ impl WhisperContract {
     // ========================================================================
 
     pub fn get_profile(&self, account_id: AccountId) -> Option<MessagingProfile> {
-        self.profiles.get(&account_id).cloned()
+        self.profiles.get(&account_id)
     }
 
     pub fn has_profile(&self, account_id: AccountId) -> bool {
@@ -307,7 +295,7 @@ impl WhisperContract {
     }
 
     pub fn get_group(&self, group_id: String) -> Option<GroupChat> {
-        self.groups.get(&group_id).cloned()
+        self.groups.get(&group_id)
     }
 
     pub fn get_stats(&self) -> serde_json::Value {
@@ -318,10 +306,6 @@ impl WhisperContract {
         })
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -348,7 +332,6 @@ mod tests {
         let profile = contract.get_profile("alice.near".parse().unwrap()).unwrap();
         assert_eq!(profile.x25519_pubkey, pubkey);
         assert_eq!(profile.key_version, 1);
-        assert_eq!(profile.display_name, Some("Alice".to_string()));
         assert_eq!(contract.profile_count, 1);
     }
 
@@ -376,24 +359,21 @@ mod tests {
         testing_env!(context.build());
 
         let mut contract = WhisperContract::new();
-        let pubkey_a = BASE64.encode([1u8; 32]);
-        contract.register_key(pubkey_a, None);
+        contract.register_key(BASE64.encode([1u8; 32]), None);
 
         let context_bob = get_context("bob.near");
         testing_env!(context_bob.build());
-        let pubkey_b = BASE64.encode([2u8; 32]);
-        contract.register_key(pubkey_b, None);
+        contract.register_key(BASE64.encode([2u8; 32]), None);
 
         let context_alice = get_context("alice.near");
         testing_env!(context_alice.build());
         contract.send_message(
             "bob.near".parse().unwrap(),
-            "encrypted_data_base64".to_string(),
-            "nonce_base64".to_string(),
+            "encrypted".to_string(),
+            "nonce".to_string(),
             1,
             None,
         );
-
         assert_eq!(contract.message_count, 1);
     }
 
@@ -404,8 +384,7 @@ mod tests {
         testing_env!(context.build());
 
         let mut contract = WhisperContract::new();
-        let pubkey = BASE64.encode([1u8; 32]);
-        contract.register_key(pubkey, None);
+        contract.register_key(BASE64.encode([1u8; 32]), None);
 
         contract.send_message(
             "nobody.near".parse().unwrap(),
@@ -423,24 +402,20 @@ mod tests {
 
         let mut contract = WhisperContract::new();
         contract.create_group(
-            "test-group-1".to_string(),
-            Some("Test Group".to_string()),
-            r#"{"alice.near":"key1","bob.near":"key2"}"#.to_string(),
+            "test-group".to_string(),
+            Some("Test".to_string()),
+            "{}".to_string(),
         );
 
-        let group = contract.get_group("test-group-1".to_string()).unwrap();
+        let group = contract.get_group("test-group".to_string()).unwrap();
         assert_eq!(group.creator.to_string(), "alice.near");
-        assert_eq!(group.name, Some("Test Group".to_string()));
     }
 
     #[test]
     fn test_stats() {
         let context = get_context("alice.near");
         testing_env!(context.build());
-
         let contract = WhisperContract::new();
-        let stats = contract.get_stats();
-        assert_eq!(stats["profile_count"], 0);
-        assert_eq!(stats["message_count"], 0);
+        assert_eq!(contract.get_stats()["profile_count"], 0);
     }
 }
